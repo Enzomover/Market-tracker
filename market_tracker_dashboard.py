@@ -7,42 +7,33 @@ from concurrent.futures import ThreadPoolExecutor
 # --- Top S&P 500 tickers ---
 TOP_SP500_TICKERS = ["NVDA", "MSFT", "AAPL", "AMZN", "META", "GOOGL", "AVGO", "BRK.B", "TSLA", "JPM"]
 
-# --- Fetch ticker data safely ---
-def update_ticker_data(
-    ticker,
-    latest_only=False,
-    retries=3,
-    delay=2,
-    period="30d",
-    start_date=None,
-    end_date=None
-):
+# --- Safe ticker data fetch ---
+def update_ticker_data(ticker, latest_only=False, retries=3, delay=2, period="30d"):
     for attempt in range(retries):
         try:
             # Download data
-            if start_date and end_date:
-                data = yf.download(ticker, start=start_date, end=end_date, interval="1d")
-            else:
-                data = yf.download(ticker, period=period, interval="1d")
-
+            data = yf.download(ticker, period=period, interval="1d")
             if data.empty:
                 continue  # retry
 
-            # Keep only essential columns
+            # Reset index and select only necessary columns
             data = data.reset_index()
-            data = data[['Date', 'Open', 'Low', 'High', 'Close']].copy()
+            required_cols = ['Date', 'Open', 'High', 'Low', 'Close']
+            data = data[[col for col in required_cols if col in data.columns]]
 
-            # Ensure numeric and drop NaNs
-            for col in ['Open','Low','High','Close']:
-                data[col] = pd.to_numeric(data[col], errors='coerce')
-            data = data.dropna(subset=['Open','Low','High','Close'])
+            # Ensure numeric
+            for col in ['Open','High','Low','Close']:
+                if col in data.columns:
+                    data[col] = pd.to_numeric(data[col], errors='coerce')
 
+            # Drop rows with NaNs
+            data = data.dropna(subset=['Open','High','Low','Close'])
             if data.empty:
                 continue  # retry
 
-            # Metrics
+            # Calculate metrics safely
             data['Upward_Move'] = data['High'] - data['Low']
-            data['Upward_Move_%'] = (data['Upward_Move'] / data['Low']) * 100
+            data['Upward_Move_%'] = (data['Upward_Move'] / data['Low']).replace([float('inf'), -float('inf')], 0).fillna(0) * 100
             data['Daily_Range'] = data['Close'] - data['Open']
 
             if latest_only:
@@ -57,7 +48,7 @@ def update_ticker_data(
     st.warning(f"{ticker} failed after {retries} attempts")
     return pd.DataFrame()
 
-# --- Multithreaded fetch with retries ---
+# --- Multithreaded latest-day fetch ---
 def fetch_all_latest(top_tickers):
     all_data = {}
 
@@ -99,15 +90,24 @@ else:
     top_movers = latest_data.sort_values("Upward_Move_%", ascending=False)
     st.dataframe(top_movers[['Ticker','Date','Upward_Move','Upward_Move_%','Daily_Range']].head(10))
 
-# --- Full 30-day historical data on demand ---
+# --- Optional full 30-day fetch ---
 if st.checkbox("Show full 30-day historical data"):
     st.info("Fetching full 30-day data (may take a few seconds)...")
     full_data_list = []
-    for ticker in TOP_SP500_TICKERS:
+
+    def fetch_full(ticker):
         df = update_ticker_data(ticker, latest_only=False)
         if not df.empty:
             df['Ticker'] = ticker
-            full_data_list.append(df)
+        return df
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(fetch_full, t): t for t in TOP_SP500_TICKERS}
+        for future in futures:
+            df = future.result()
+            if df is not None and not df.empty:
+                full_data_list.append(df)
+
     if full_data_list:
         full_data = pd.concat(full_data_list).reset_index(drop=True)
         st.subheader("Full 30-Day Data")
